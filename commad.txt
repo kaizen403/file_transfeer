@@ -1,18 +1,193 @@
-cd ~/D/gdt_templates/my_symbols
-source .venv/bin/activate.fish
+cp runs/detect/symbol_30shot/weights/best.pt \
+   weights/icon_detect/best.pt
 
 
-pip install --upgrade ultralytics
 
-https://drive.google.com/drive/folders/1dlsSsqgBJSLn2g1ZIy8FrDGkLuPsiX_B?usp=drive_link
+   #!/usr/bin/env python3
+"""
+text_and_symbol_batch.py
 
-yolo detect train \
-  --model yolov8n.pt \
-  --data data.yaml \
-  --epochs 100 \
-  --imgsz 640 \
-  --batch 8 \
-  --cache \
-  --patience 20 \
-  --name symbol_30shot
+• Detects text  (Multi-scale EAST, CPU by default)
+• Detects symbols (custom YOLOv8, GPU)
+Outputs annotated images with:
+   red   = text
+   blue  = symbols
+"""
+
+# ───────────── Imports ─────────────
+import os, sys, cv2, argparse, numpy as np
+from typing import List, Tuple
+from pathlib import Path
+from PIL import Image
+import torch
+from ultralytics import YOLO
+from imutils.object_detection import non_max_suppression
+
+# ───────────── 0) GPU & weights  ─────────────
+if not torch.cuda.is_available():
+    sys.exit("❌  No CUDA GPU found.")
+
+# early parser just for --weights
+early = argparse.ArgumentParser(add_help=False)
+early.add_argument("--weights",
+                   default="weights/icon_detect/best.pt",
+                   help="Custom symbol model (.pt)")
+early_ns, _ = early.parse_known_args()
+YOLO_WEIGHTS = early_ns.weights
+if not Path(YOLO_WEIGHTS).is_file():
+    sys.exit(f"❌  weights file '{YOLO_WEIGHTS}' not found")
+
+yolo_model = YOLO(YOLO_WEIGHTS).to("cuda")
+try: yolo_model.model.half()
+except AttributeError: pass    # FP16 may fail on some GPUs
+
+# ───────────── 1) Multi-res EAST text detector ─────────────
+class MultiResolutionEAST:
+    def __init__(self, model_path, resolutions):
+        self.net = cv2.dnn.readNet(model_path)
+        self.resolutions = resolutions
+        self.layers = ["feature_fusion/Conv_7/Sigmoid",
+                       "feature_fusion/concat_3"]
+
+    def _detect(self, img, target, conf):
+        H,W = img.shape[:2]; newW,newH = target
+        rW, rH = W/newW, H/newH
+        blob = cv2.dnn.blobFromImage(cv2.resize(img, target), 1.0, target,
+                                     (123.68,116.78,103.94),
+                                     swapRB=True, crop=False)
+        self.net.setInput(blob)
+        scores, geo = self.net.forward(self.layers)
+        boxes, scores_out = [], []
+        for y in range(scores.shape[2]):
+            sd = scores[0,0,y]
+            x0,x1,x2,x3,ang = geo[0,0,y],geo[0,1,y],geo[0,2,y],geo[0,3,y],geo[0,4,y]
+            for x in range(scores.shape[3]):
+                if sd[x] < conf: continue
+                offX, offY = x*4.0, y*4.0
+                cos,sin = np.cos(ang[x]), np.sin(ang[x])
+                h,w = x0[x]+x2[x], x1[x]+x3[x]
+                endX = int(offX + cos*x1[x] + sin*x2[x])
+                endY = int(offY - sin*x1[x] + cos*x2[x])
+                startX, startY = int(endX - w), int(endY - h)
+                boxes.append((int(startX*rW),int(startY*rH),
+                              int(endX*rW),  int(endY*rH)))
+                scores_out.append(float(sd[x]))
+        return (non_max_suppression(np.array(boxes), probs=scores_out).tolist()
+                if boxes else [])
+
+    def detect(self, img, conf=0.5):
+        all_boxes = [self._detect(img, res, conf) for res in self.resolutions]
+        flat = [b for sub in all_boxes for b in sub]
+        if not flat: return []
+        return non_max_suppression(np.array(flat), overlapThresh=0.7).tolist()
+
+multi_east = MultiResolutionEAST(
+    "frozen_east_text_detection.pb",
+    resolutions=[(960,960),(1600,1600),(3776,3776)]
+)
+
+# ───────────── 2) utility: tiling for YOLO ─────────────
+def gen_tiles(img, size=1024, overlap=128):
+    h,w = img.shape[:2]; step = max(size-overlap,1)
+    for y in range(0,h,step):
+        for x in range(0,w,step):
+            yield img[y:y+size, x:x+size], x, y
+
+# ───────────── 3) YOLO tile inference ─────────────
+def detect_symbols(img, size, ov, conf, iou_thr):
+    boxes=[]
+    for tile,ox,oy in gen_tiles(img,size,ov):
+        res = yolo_model.predict(tile, device="cuda", conf=conf,
+                                 iou=iou_thr, half=True, verbose=False)
+        if res and len(res[0].boxes):
+            for b in res[0].boxes:
+                x1,y1,x2,y2 = map(int,b.xyxy[0].tolist())
+                boxes.append((x1+ox, y1+oy, x2+ox, y2+oy))
+    return boxes
+
+# ───────────── 4) IoU merge for symbols ─────────────
+def iou(a,b):
+    xA,yA = max(a[0],b[0]), max(a[1],b[1])
+    xB,yB = min(a[2],b[2]), min(a[3],b[3])
+    if xB<xA or yB<yA: return 0
+    inter=(xB-xA)*(yB-yA)
+    return inter/((a[2]-a[0])*(a[3]-a[1])+(b[2]-b[0])*(b[3]-b[1])-inter+1e-9)
+def merge(boxes, thr=0.3):
+    if not boxes: return []
+    boxes = sorted(boxes, key=lambda b:(b[2]-b[0])*(b[3]-b[1]), reverse=True)
+    used=[False]*len(boxes); out=[]
+    for i,b in enumerate(boxes):
+        if used[i]: continue
+        cur=b
+        for j in range(i+1,len(boxes)):
+            if used[j]: continue
+            if iou(cur,boxes[j])>thr:
+                cur=(min(cur[0],boxes[j][0]),min(cur[1],boxes[j][1]),
+                     max(cur[2],boxes[j][2]),max(cur[3],boxes[j][3]))
+                used[j]=True
+        used[i]=True; out.append(cur)
+    return out
+
+# ───────────── 5) drawing ─────────────
+def draw(img, boxes, col, t=2):
+    out=img.copy()
+    for x1,y1,x2,y2 in boxes:
+        cv2.rectangle(out,(x1,y1),(x2,y2),col,t)
+    return out
+
+# ───────────── 6) full CLI ─────────────
+parser = argparse.ArgumentParser(
+    parents=[early],
+    description="Batch detect text (EAST) + symbols (YOLO)"
+)
+parser.add_argument("input_dir")
+parser.add_argument("output_dir")
+parser.add_argument("--tile",     type=int,   default=1024)
+parser.add_argument("--overlap",  type=int,   default=128)
+parser.add_argument("--east_conf",type=float, default=0.5)
+parser.add_argument("--yolo_conf",type=float, default=0.25)
+parser.add_argument("--merge_iou",type=float, default=0.3)
+args = parser.parse_args()
+
+Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+img_ext=(".png",".jpg",".jpeg",".bmp",".tif",".tiff")
+
+for fn in sorted(os.listdir(args.input_dir)):
+    if not fn.lower().endswith(img_ext): continue
+    img=cv2.cvtColor(np.array(
+        Image.open(Path(args.input_dir)/fn).convert("RGB")),
+        cv2.COLOR_RGB2BGR)
+    print("→", fn)
+    txt = multi_east.detect(img, conf=args.east_conf)
+    sym = detect_symbols(img,args.tile,args.overlap,
+                         args.yolo_conf,0.45)
+    sym = merge(sym, thr=args.merge_iou)
+    anno = draw(img, txt, (0,0,255),2)
+    anno = draw(anno, sym,(255,0,0),2)
+    cv2.imwrite(str(Path(args.output_dir)/f"{Path(fn).stem}_annotated.png"),
+                anno)
+
+print("✅  Done. Results →", args.output_dir)
+
+
+
+
+
+
+
+
+
+
+# activate venv
+source my_symbols/.venv/bin/activate.fish
+
+# default (weights/icon_detect/best.pt)
+python3 text_and_symbol_batch.py \
+        "OCR TEST-28-04-25"  OCR_ANNOTATED
+
+# OR specify any .pt file
+python3 text_and_symbol_batch.py \
+        --weights runs/detect/symbol_30shot/weights/best.pt \
+        --yolo_conf 0.15 \
+        "OCR TEST-28-04-25"  OCR_ANNOTATED
 
