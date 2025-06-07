@@ -167,6 +167,12 @@ for fn in sorted(os.listdir(args.input_dir)):
     cv2.imwrite(str(Path(args.output_dir)/f"{Path(fn).stem}_annotated.png"),
                 anno)
 
+    print("→", fn)
+    txt = multi_east.detect(img, conf=args.east_conf)
+    sym = detect_symbols(...)
+    print(f"  text boxes: {len(txt)}, symbol boxes: {len(sym)}")   # <-- add
+
+
 print("✅  Done. Results →", args.output_dir)
 
 
