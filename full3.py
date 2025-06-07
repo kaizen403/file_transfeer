@@ -163,26 +163,33 @@ def merge_sym(boxes, thr, min_h):
     return [b for k,b in zip(keep,boxes) if k]
 
 # ───────────────────── OCR sub-detectors ──────────
-def detect_paddle(img,tile,ov):
-    out=[]
-    for tile_img,ox,oy in tiles(img,tile,ov):
-        pages = paddle_det.ocr(tile_img,cls=False) or []   # guard None
+# ───────── detect_paddle (patched) ─────────
+def detect_paddle(img, tile, ov):
+    out = []
+    for tile_img, ox, oy in tiles(img, tile, ov):
+        pages = paddle_det.ocr(tile_img, cls=False) or []
         for page in pages:
-            for pts,_ in page:
-                xs=[p[0] for p in pts]; ys=[p[1] for p in pts]
-                out.append((int(min(xs)+ox),int(min(ys)+oy),
-                            int(max(xs)+ox),int(max(ys)+oy)))
+            if not page:                       # <── NEW
+                continue
+            for pts, _ in page:
+                xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+                out.append((int(min(xs)+ox), int(min(ys)+oy),
+                            int(max(xs)+ox), int(max(ys)+oy)))
     return out
 
-def detect_easy(img,tile,ov):
-    out=[]
-    for tile_img,ox,oy in tiles(img,tile,ov):
-        res=easy_reader.readtext(
-            cv2.cvtColor(tile_img,cv2.COLOR_BGR2RGB),detail=1) or []  # guard None
-        for pts,_,_ in res:
-            xs=[p[0] for p in pts]; ys=[p[1] for p in pts]
-            out.append((int(min(xs)+ox),int(min(ys)+oy),
-                        int(max(xs)+ox),int(max(ys)+oy)))
+# ───────── detect_easy (patched) ───────────
+def detect_easy(img, tile, ov):
+    out = []
+    for tile_img, ox, oy in tiles(img, tile, ov):
+        res = easy_reader.readtext(
+            cv2.cvtColor(tile_img, cv2.COLOR_BGR2RGB), detail=1) or []
+        for item in res:
+            if not item:                       # <── NEW
+                continue
+            pts, _, _ = item
+            xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+            out.append((int(min(xs)+ox), int(min(ys)+oy),
+                        int(max(xs)+ox), int(max(ys)+oy)))
     return out
 
 def cleanup(boxes,thr):
