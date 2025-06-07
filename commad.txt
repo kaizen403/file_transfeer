@@ -4,6 +4,7 @@ source .venv/bin/activate.fish
 
 pip install --upgrade ultralytics
 
+https://drive.google.com/drive/folders/1dlsSsqgBJSLn2g1ZIy8FrDGkLuPsiX_B?usp=drive_link
 
 yolo detect train \
   --model yolov8n.pt \
