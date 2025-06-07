@@ -1,0 +1,17 @@
+cd ~/D/gdt_templates/my_symbols
+source .venv/bin/activate.fish
+
+
+pip install --upgrade ultralytics
+
+
+yolo detect train \
+  --model yolov8n.pt \
+  --data data.yaml \
+  --epochs 100 \
+  --imgsz 640 \
+  --batch 8 \
+  --cache \
+  --patience 20 \
+  --name symbol_30shot
+
